@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Pipeline outputs
+backend/outputs/
+backend/tools/
+
+# Env / secrets
+.env
+*.env
+
+# OS
+.DS_Store
