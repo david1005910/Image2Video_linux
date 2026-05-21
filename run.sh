@@ -10,7 +10,7 @@ cd "$ROOT/backend"
 pip install -q -r requirements.txt
 
 echo "[2/3] Starting backend (http://localhost:8000)..."
-uvicorn main:app --host 0.0.0.0 --port 8000 &
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 
 # Frontend
