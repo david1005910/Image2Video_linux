@@ -4,63 +4,87 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Single Jupyter notebook (`image_to_video_pipeline.ipynb`) implementing a full image-to-video pipeline on Google Colab, using Wan 2.2 I2V as the core generation model. Purpose: validate model quality before scaling to production spec-kit.
+Fullstack Image-to-Video pipeline app running locally on Linux with a GPU. The core model is **Wan 2.2 I2V** (via diffusers). A Jupyter notebook (`image_to_video_pipeline.ipynb`) covers the original Google Colab prototype; the `backend/` + `frontend/` directories are the production local app.
 
-## Running the Pipeline
-
-This project runs on **Google Colab**, not locally. The notebook is designed for sequential cell execution.
+## Development Commands
 
 ```bash
-# Open in Colab (from Google Drive)
-# Runtime → Run all  OR  Ctrl+F9
+# Start both services together
+./run.sh
 
-# For local Jupyter (requires GPU with 16GB+ VRAM):
-pip install jupyter
-jupyter notebook image_to_video_pipeline.ipynb
+# Backend only (from backend/)
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+# Frontend only (from frontend/)
+cd frontend
+npm install
+npm run dev        # dev server at http://localhost:5173
+npm run build      # build → frontend/dist/ (served by FastAPI in prod)
+npm run preview    # preview production build
 ```
 
-Dependencies install inline via `pip install -q` cells — no separate requirements file. Models cache to Google Drive at `HF_HOME=/content/drive/MyDrive/img2video/models/hf_cache`.
+No test suite exists yet.
 
-## Pipeline Architecture
-
-Seven sequential stages, each writing output to a numbered folder on Google Drive:
+## Architecture
 
 ```
-Pollinations API → (optional) Real-ESRGAN upscale → Gemini motion prompt
-    → Wan 2.2 I2V (diffusers) → RIFE interpolation → Real-ESRGAN NCNN-Vulkan → FFmpeg grade+audio
+frontend/ (React + Vite + Tailwind, port 5173)
+    └── src/api.js              REST + WebSocket calls to backend
+    └── src/components/
+            ConfigForm.jsx      Pipeline config form → POST /api/jobs
+            JobList.jsx         Sidebar job list
+            JobDetail.jsx       Live job view (WebSocket /ws/{job_id})
+
+backend/ (FastAPI + uvicorn, port 8000)
+    ├── main.py                 Routes + WebSocket endpoint
+    ├── job_manager.py          In-memory job store + pub/sub queues
+    ├── pipeline.py             Six-stage async pipeline
+    └── schemas.py              Pydantic models (PipelineConfig, Job, JobStage)
 ```
 
-Output folders under `/MyDrive/img2video/`:
-- `01_images/` — source image from Pollinations
-- `02_upscaled/` — upscaled input (optional)
-- `03_videos_raw/` — raw Wan 2.2 output
-- `04_interpolated/` — RIFE frame-interpolated
-- `05_upscaled_video/` — ESRGAN upscaled frames
-- `06_final/` — color-graded + audio-mixed final
+### Request lifecycle
 
-## Configuration
+1. Frontend POSTs `PipelineConfig` to `POST /api/jobs`.
+2. `main.py` creates a `Job` in `JobManager`, then fires `run_pipeline(...)` as an `asyncio.Task`.
+3. Pipeline stages update job state via `update(**kw)` and `log(msg)` callbacks.
+4. `JobManager._broadcast` fans out every state change to all subscribed `asyncio.Queue`s.
+5. Frontend `JobDetail` holds a WebSocket to `/ws/{job_id}` and re-renders on each message.
 
-All user parameters live in a single `CONFIG` dict near the top of the notebook. Key fields:
+### Pipeline stages (`pipeline.py`)
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `base_width` | 1280 | Reduce to 832 for T4 VRAM limits |
-| `video_length_frames` | 49 | Reduce to 33 for lower VRAM |
-| `num_inference_steps` | 30 | Quality vs. speed trade-off |
-| `interpolation_fps` | 48 | RIFE target; 16→48 interpolation |
-| `upscale_factor` | 2 | Applied to final video frames |
+| Stage | Progress | Output file |
+|-------|----------|-------------|
+| `generating_image` | 5→15% | `outputs/{job_id}/01_source.png` |
+| `generating_motion_prompt` | 18→22% | (stored in config) |
+| `generating_video` | 25→65% | `outputs/{job_id}/03_raw.mp4` |
+| `interpolating` | 68→78% | `outputs/{job_id}/04_interpolated.mp4` |
+| `upscaling` | 80→90% | `outputs/{job_id}/05_upscaled.mp4` |
+| `grading` | 92→100% | `outputs/{job_id}/06_final.mp4` |
 
-Width/height are auto-padded to 8-pixel multiples (Wan 2.2 requirement).
+Wan 2.2 inference runs in a thread executor while the event loop drains a `queue.Queue` for per-step progress updates (mapped to 25–65%).
 
-## Key Design Decisions
+### External tool dependencies
 
-- **Fallback chain per stage:** diffusers OR ComfyUI for I2V; FFmpeg `minterpolate` if RIFE weights unavailable; optional Veo 3.1 API for high-quality shots.
-- **Gemini API key** loaded from Colab Secrets (not hardcoded). Motion prompt generation is optional — manual prompt fallback is available.
-- **Pollinations** is used for image generation because it's free with no API key.
-- **Model compatibility:** `diffusers>=0.31` required; API for `WanImageToVideoPipeline` may differ across versions — check release notes if import errors occur.
+These must be installed separately — their absence triggers graceful fallbacks:
 
-## Hardware Requirements
+- `tools/Practical-RIFE/inference_video.py` — frame interpolation; falls back to FFmpeg `minterpolate`
+- `tools/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan` — video upscaling; skipped if binary missing
+- `ffmpeg` — required (must be on PATH)
 
-- Minimum: T4 GPU (16 GB VRAM) → 480–640p output
-- Recommended: L4 or A100 → 720–1080p output
-- First run (model download): 20–40 min; subsequent runs: 5–15 min per video
+### Key config fields (`schemas.py: PipelineConfig`)
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `base_width` | 1280 | Reduce to 832 for T4-class GPUs |
+| `video_length_frames` | 49 | Min 17; reduce for lower VRAM |
+| `video_steps` | 30 | Quality vs. speed |
+| `device` | `cuda` | `cpu` supported but very slow |
+| `gemini_api_key` | null | Optional; enables AI motion prompt generation |
+
+Width/height are auto-padded to 8-pixel multiples (Wan 2.2 requirement) in `pipeline._resolution`.
+
+## Colab Notebook
+
+`image_to_video_pipeline.ipynb` is a standalone prototype for Google Colab. It mirrors the same seven-stage pipeline but installs deps inline and writes outputs to Google Drive. It is not used by the local app.
